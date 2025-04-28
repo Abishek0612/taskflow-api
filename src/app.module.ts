@@ -4,23 +4,41 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { BullModule } from '@nestjs/bullmq';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
+import { CacheModule } from '@nestjs/cache-manager';
 import { UsersModule } from './modules/users/users.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { TaskProcessorModule } from './queues/task-processor/task-processor.module';
 import { ScheduledTasksModule } from './queues/scheduled-tasks/scheduled-tasks.module';
 import { CacheService } from './common/services/cache.service';
-import jwtConfig from '@config/jwt.config';
+import { CustomRedisModule } from './common/modules/redis.module';
 
 @Module({
   imports: [
     // Configuration
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [jwtConfig],
+      load: [
+        require('./config/app.config').default,
+        require('./config/database.config').default,
+        require('./config/jwt.config').default,
+        require('./config/bull.config').default,
+      ],
     }),
 
-    // Database
+    // Use our custom Redis module
+    CustomRedisModule,
+
+    CacheModule.registerAsync({
+      isGlobal: true,
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: async (configService: ConfigService) => ({
+        ttl: 60 * 60, // 1 hour default TTL
+        max: 1000, // maximum number of items in cache
+      }),
+    }),
+
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -34,13 +52,14 @@ import jwtConfig from '@config/jwt.config';
         entities: [__dirname + '/**/*.entity{.ts,.js}'],
         synchronize: configService.get('NODE_ENV') === 'development',
         logging: configService.get('NODE_ENV') === 'development',
+        logger: configService.get('NODE_ENV') === 'development' ? 'advanced-console' : undefined,
+        poolSize: 10,
+        maxQueryExecutionTime: 1000,
       }),
     }),
 
-    // Scheduling
     ScheduleModule.forRoot(),
 
-    // Queue
     BullModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -49,39 +68,36 @@ import jwtConfig from '@config/jwt.config';
           host: configService.get('REDIS_HOST'),
           port: configService.get('REDIS_PORT'),
         },
+        defaultJobOptions: {
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 1000,
+          },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
       }),
     }),
 
-    // Rate limiting
     ThrottlerModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => [
         {
           ttl: 60,
-          limit: 10,
+          limit: configService.get('NODE_ENV') === 'production' ? 10 : 100,
         },
       ],
     }),
 
-    // Feature modules
     UsersModule,
     TasksModule,
     AuthModule,
-
-    // Queue processing modules
     TaskProcessorModule,
     ScheduledTasksModule,
   ],
-  providers: [
-    // Inefficient: Global cache service with no configuration options
-    // This creates a single in-memory cache instance shared across all modules
-    CacheService,
-  ],
-  exports: [
-    // Exporting the cache service makes it available to other modules
-    // but creates tight coupling
-    CacheService,
-  ],
+  providers: [CacheService],
+  exports: [CacheService],
 })
 export class AppModule {}

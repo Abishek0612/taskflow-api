@@ -1,76 +1,111 @@
-import { Injectable, CanActivate, ExecutionContext, HttpException, HttpStatus } from '@nestjs/common';
+// src/common/guards/rate-limit.guard.ts
+
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  HttpException,
+  HttpStatus,
+  Logger,
+  Inject,
+} from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Observable } from 'rxjs';
-
-// Inefficient in-memory storage for rate limiting
-// Problems:
-// 1. Not distributed - breaks in multi-instance deployments
-// 2. Memory leak - no cleanup mechanism for old entries
-// 3. No persistence - resets on application restart
-// 4. Inefficient data structure for lookups in large datasets
-const requestRecords: Record<string, { count: number, timestamp: number }[]> = {};
+import { RATE_LIMIT_KEY, RateLimitOptions } from '../decorators/rate-limit.decorator';
+import { Redis } from 'ioredis';
+import * as crypto from 'crypto';
+import { REDIS_CLIENT } from '../providers/redis.provider';
 
 @Injectable()
 export class RateLimitGuard implements CanActivate {
-  constructor(private reflector: Reflector) {}
+  private readonly logger = new Logger(RateLimitGuard.name);
 
-  canActivate(
-    context: ExecutionContext,
-  ): boolean | Promise<boolean> | Observable<boolean> {
+  constructor(
+    private reflector: Reflector,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+  ) {}
+
+  canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean> {
+    // Get rate limit  from decorator
+    const rateLimitOptions = this.reflector.getAllAndOverride<RateLimitOptions>(RATE_LIMIT_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // If no rate limit options are set, allow the request
+    if (!rateLimitOptions) {
+      return true;
+    }
+
     const request = context.switchToHttp().getRequest();
+
+    // Use IP and route as the rate limit key identifier
+    // Hash the IP for privacy reasons
     const ip = request.ip;
-    
-    // Inefficient: Uses IP address directly without any hashing or anonymization
-    // Security risk: Storing raw IPs without compliance consideration
-    return this.handleRateLimit(ip);
+    const hashedIp = this.hashIp(ip);
+    const route = `${request.method}:${request.route?.path || request.url}`;
+
+    return this.handleRateLimit(hashedIp, route, rateLimitOptions);
   }
 
-  private handleRateLimit(ip: string): boolean {
-    const now = Date.now();
-    const windowMs = 60 * 1000; // 1 minute
-    const maxRequests = 100; // Max 100 requests per minute
-    
-    // Inefficient: Creates a new array for each IP if it doesn't exist
-    if (!requestRecords[ip]) {
-      requestRecords[ip] = [];
+  private async handleRateLimit(
+    hashedIp: string,
+    route: string,
+    options: RateLimitOptions,
+  ): Promise<boolean> {
+    const { limit, windowMs } = options;
+    const windowSeconds = Math.floor(windowMs / 1000);
+
+    // Create a Redis key that combines the IP hash and route
+    const key = `ratelimit:${hashedIp}:${route}`;
+
+    try {
+      // Use Redis for distributed rate limiting with sliding window
+      // Get the current count
+      const current = await this.redis.get(key);
+      const currentCount = current ? parseInt(current, 10) : 0;
+
+      if (currentCount >= limit) {
+        // Get TTL of the key to calculate reset time
+        const ttl = await this.redis.ttl(key);
+
+        this.logger.warn(
+          `Rate limit exceeded for ${hashedIp} on ${route}: ${currentCount}/${limit}`,
+        );
+
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Too many requests, please try again later.',
+            limit,
+            current: currentCount,
+            remainingRequests: 0,
+            nextValidRequestTime: new Date(Date.now() + ttl * 1000),
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+
+      // Increment the counter and set expiration if it's a new key
+      await this.redis.multi().incr(key).expire(key, windowSeconds).exec();
+
+      return true;
+    } catch (error) {
+      // If the error is our own rate limit exception, rethrow it
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      // For Redis errors, log and allow the request (fail open for availability)
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorStack = error instanceof Error ? error.stack : undefined;
+
+      this.logger.error(`Error in rate limit check: ${errorMessage}`, errorStack);
+      return true;
     }
-    
-    // Inefficient: Filter operation on potentially large array
-    // Every request causes a full array scan
-    const windowStart = now - windowMs;
-    requestRecords[ip] = requestRecords[ip].filter(record => record.timestamp > windowStart);
-    
-    // Check if rate limit is exceeded
-    if (requestRecords[ip].length >= maxRequests) {
-      // Inefficient error handling: Too verbose, exposes internal details
-      throw new HttpException({
-        status: HttpStatus.TOO_MANY_REQUESTS,
-        error: 'Rate limit exceeded',
-        message: `You have exceeded the ${maxRequests} requests per ${windowMs / 1000} seconds limit.`,
-        limit: maxRequests,
-        current: requestRecords[ip].length,
-        ip: ip, // Exposing the IP in the response is a security risk
-        remaining: 0,
-        nextValidRequestTime: requestRecords[ip][0].timestamp + windowMs,
-      }, HttpStatus.TOO_MANY_REQUESTS);
-    }
-    
-    // Inefficient: Potential race condition in concurrent environments
-    // No locking mechanism when updating shared state
-    requestRecords[ip].push({ count: 1, timestamp: now });
-    
-    // Inefficient: No periodic cleanup task, memory usage grows indefinitely
-    // Dead entries for inactive IPs are never removed
-    
-    return true;
+  }
+
+  private hashIp(ip: string): string {
+    return crypto.createHash('sha256').update(ip, 'utf8').digest('hex');
   }
 }
-
-// Decorator to apply rate limiting to controllers or routes
-export const RateLimit = (limit: number, windowMs: number) => {
-  // Inefficient: Decorator doesn't actually use the parameters
-  // This is misleading and causes confusion
-  return (target: any, key?: string, descriptor?: any) => {
-    return descriptor;
-  };
-}; 

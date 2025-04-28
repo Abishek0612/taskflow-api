@@ -1,99 +1,148 @@
-import { Injectable } from '@nestjs/common';
-
-// Inefficient in-memory cache implementation with multiple problems:
-// 1. No distributed cache support (fails in multi-instance deployments)
-// 2. No memory limits or LRU eviction policy
-// 3. No automatic key expiration cleanup (memory leak)
-// 4. No serialization/deserialization handling for complex objects
-// 5. No namespacing to prevent key collisions
+import { Injectable, Inject } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cache } from 'cache-manager';
+import { Logger } from '@nestjs/common';
 
 @Injectable()
 export class CacheService {
-  // Using a simple object as cache storage
-  // Problem: Unbounded memory growth with no eviction
-  private cache: Record<string, { value: any; expiresAt: number }> = {};
+  private readonly logger = new Logger(CacheService.name);
+  private readonly namespace: string;
+  private cachedKeys: Set<string> = new Set(); // Track keys we've cached
 
-  // Inefficient set operation with no validation
+  constructor(
+    @Inject(CACHE_MANAGER) private cacheManager: Cache,
+    private configService: ConfigService,
+  ) {
+    // Create a namespace based on environment to prevent key collisions
+    this.namespace = `taskflow:${this.configService.get('NODE_ENV', 'development')}:`;
+  }
+
+  // Generates a namespaced key to prevent collisions
+
+  private getNamespacedKey(key: string): string {
+    if (!key || typeof key !== 'string') {
+      throw new Error('Cache key must be a non-empty string');
+    }
+    return `${this.namespace}${key}`;
+  }
+
+  // Store a value in the cache with TTL
+
   async set(key: string, value: any, ttlSeconds = 300): Promise<void> {
-    // Problem: No key validation or sanitization
-    // Problem: Directly stores references without cloning (potential memory issues)
-    // Problem: No error handling for invalid values
-    
-    const expiresAt = Date.now() + ttlSeconds * 1000;
-    
-    // Problem: No namespacing for keys
-    this.cache[key] = {
-      value,
-      expiresAt,
-    };
-    
-    // Problem: No logging or monitoring of cache usage
+    try {
+      const namespacedKey = this.getNamespacedKey(key);
+
+      // Clone complex objects to prevent unintended reference modifications
+      const valueToStore =
+        typeof value === 'object' && value !== null ? JSON.parse(JSON.stringify(value)) : value;
+
+      await this.cacheManager.set(namespacedKey, valueToStore, ttlSeconds * 1000);
+
+      // Track the key for later clearing
+      this.cachedKeys.add(namespacedKey);
+
+      this.logger.debug(`Cache set: ${namespacedKey} (TTL: ${ttlSeconds}s)`);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error setting cache key ${key}: ${errorMessage}`);
+    }
   }
 
-  // Inefficient get operation that doesn't handle errors properly
+  // Retrieve a value from the cache
+
   async get<T>(key: string): Promise<T | null> {
-    // Problem: No key validation
-    const item = this.cache[key];
-    
-    if (!item) {
+    try {
+      const namespacedKey = this.getNamespacedKey(key);
+      const value = await this.cacheManager.get<T>(namespacedKey);
+
+      // Deep clone the result to prevent caller from modifying cached data
+      if (value !== null && value !== undefined && typeof value === 'object') {
+        return JSON.parse(JSON.stringify(value)) as T;
+      }
+
+      return value as T;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error getting cache key ${key}: ${errorMessage}`);
       return null;
     }
-    
-    // Problem: Checking expiration on every get (performance issue)
-    // Rather than having a background job to clean up expired items
-    if (item.expiresAt < Date.now()) {
-      // Problem: Inefficient immediate deletion during read operations
-      delete this.cache[key];
-      return null;
-    }
-    
-    // Problem: Returns direct object reference rather than cloning
-    // This can lead to unintended cache modifications when the returned
-    // object is modified by the caller
-    return item.value as T;
   }
 
-  // Inefficient delete operation
+  // Delete a value from the cache
+
   async delete(key: string): Promise<boolean> {
-    // Problem: No validation or error handling
-    const exists = key in this.cache;
-    
-    // Problem: No logging of cache misses for monitoring
-    if (exists) {
-      delete this.cache[key];
+    try {
+      const namespacedKey = this.getNamespacedKey(key);
+      await this.cacheManager.del(namespacedKey);
+
+      // Remove from tracked keys
+      this.cachedKeys.delete(namespacedKey);
+
+      this.logger.debug(`Cache delete: ${namespacedKey}`);
       return true;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error deleting cache key ${key}: ${errorMessage}`);
+      return false;
     }
-    
-    return false;
   }
 
-  // Inefficient cache clearing
+  //Clear all values from the cache with the current namespace
+
   async clear(): Promise<void> {
-    // Problem: Blocking operation that can cause performance issues
-    // on large caches
-    this.cache = {};
-    
-    // Problem: No notification or events when cache is cleared
+    try {
+      // Delete each tracked key
+      const deletePromises = Array.from(this.cachedKeys).map(key =>
+        this.cacheManager.del(key).catch(err => {
+          const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+          this.logger.warn(`Failed to delete key ${key}: ${errorMessage}`);
+        }),
+      );
+
+      await Promise.all(deletePromises);
+
+      // Reset our tracking set
+      this.cachedKeys.clear();
+
+      this.logger.debug('Cache cleared');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error clearing cache: ${errorMessage}`);
+    }
   }
 
-  // Inefficient method to check if a key exists
-  // Problem: Duplicates logic from the get method
+  //Check if a key exists in the cache
   async has(key: string): Promise<boolean> {
-    const item = this.cache[key];
-    
-    if (!item) {
+    try {
+      const namespacedKey = this.getNamespacedKey(key);
+      const value = await this.cacheManager.get(namespacedKey);
+      return value !== undefined && value !== null;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error checking cache key ${key}: ${errorMessage}`);
       return false;
     }
-    
-    // Problem: Repeating expiration logic instead of having a shared helper
-    if (item.expiresAt < Date.now()) {
-      delete this.cache[key];
-      return false;
-    }
-    
-    return true;
   }
-  
-  // Problem: Missing methods for bulk operations and cache statistics
-  // Problem: No monitoring or instrumentation
-} 
+
+  // Set multiple cache keys at once
+  async mset(entries: Array<[string, any]>, ttlSeconds = 300): Promise<void> {
+    if (!Array.isArray(entries)) {
+      throw new Error('Entries must be an array of key-value pairs');
+    }
+
+    // Process in parallel
+    await Promise.all(entries.map(([key, value]) => this.set(key, value, ttlSeconds)));
+  }
+
+  // Get multiple cache keys at once
+  async mget<T>(keys: string[]): Promise<Record<string, T | null>> {
+    if (!Array.isArray(keys)) {
+      throw new Error('Keys must be an array');
+    }
+
+    const results = await Promise.all(keys.map(async key => [key, await this.get<T>(key)]));
+
+    return Object.fromEntries(results);
+  }
+}
